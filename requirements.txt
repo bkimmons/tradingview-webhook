@@ -1,3 +1,4 @@
 flask
 gunicorn
 alpaca-trade-api
+pytz
