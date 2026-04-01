@@ -20,7 +20,7 @@ api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 ALLOWED_TICKERS   = ["TSLA", "AAPL", "NVDA", "AMZN"]
 RISK_PERCENTAGE   = 0.05   # 5% of portfolio per trade
 STOP_LOSS_PCT     = 0.02   # 2% stop loss below entry price
-TAKE_PROFIT_PCT   = 0.04   # 4% take profit above entry (2:1 reward/risk)
+TAKE_PROFIT_PCT  = 0.025  # 2.5% take profit above entry
 STOP_TRADING_HOUR = 12     # Stop new trades at or after this hour (PDT)
 STOP_TRADING_MIN  = 30
 
