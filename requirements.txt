@@ -1,6 +1,6 @@
 flask==3.0.3
 flask-cors==4.0.0
-alpaca-trade-api==3.3.2
+alpaca-trade-api==3.2.0
 gunicorn==22.0.0
 pytz==2024.1
 requests==2.31.0
