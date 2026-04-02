@@ -1,15 +1,10 @@
-ApexTrade Super Bot v2.0
-Enhanced with daily market intelligence — searches the web every morning
-to determine if it's a good day to trade and finds best entry/exit points.
-"""
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, secrets, logging
+import os, logging
 from datetime import datetime
 import pytz, requests
 from bs4 import BeautifulSoup
 import alpaca_trade_api as tradeapi
-from market_intelligence import get_market_report
 
 app = Flask(__name__)
 CORS(app)
@@ -23,51 +18,143 @@ BASE_URL   = os.environ.get("ALPACA_BASE_URL",   "https://paper-api.alpaca.marke
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-ALLOWED_TICKERS    = ["TSLA", "AAPL", "NVDA", "AMZN"]
-RISK_PERCENTAGE    = float(os.environ.get("RISK_PCT",        "0.005"))
-STOP_LOSS_PCT      = float(os.environ.get("STOP_LOSS_PCT",   "0.02"))
-TAKE_PROFIT_PCT    = float(os.environ.get("TAKE_PROFIT_PCT", "0.025"))
-STOP_TRADING_HOUR  = int(os.environ.get("STOP_HOUR", "12"))
-STOP_TRADING_MIN   = int(os.environ.get("STOP_MIN",  "30"))
-MAX_DAILY_TRADES   = int(os.environ.get("MAX_TRADES", "2"))
-MIN_CONFIDENCE     = int(os.environ.get("MIN_CONFIDENCE", "40"))  # Skip if market confidence < this
+ALLOWED_TICKERS   = ["TSLA", "AAPL", "NVDA", "AMZN"]
+RISK_PCT          = float(os.environ.get("RISK_PCT",        "0.005"))
+STOP_LOSS_PCT     = float(os.environ.get("STOP_LOSS_PCT",   "0.02"))
+TAKE_PROFIT_PCT   = float(os.environ.get("TAKE_PROFIT_PCT", "0.025"))
+STOP_HOUR         = int(os.environ.get("STOP_HOUR",  "12"))
+STOP_MIN          = int(os.environ.get("STOP_MIN",   "30"))
+MAX_TRADES        = int(os.environ.get("MAX_TRADES", "2"))
+MIN_CONFIDENCE    = int(os.environ.get("MIN_CONFIDENCE", "40"))
 
 trade_log = {}
+_cache    = {"date": None, "report": None}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MARKET INTELLIGENCE (built-in, no separate file needed)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_market_report(force=False):
+    pdt   = pytz.timezone("America/Los_Angeles")
+    today = datetime.now(pdt).date()
+    if not force and _cache["date"] == today and _cache["report"]:
+        return _cache["report"]
+
+    log.info("Running daily market intelligence scan...")
+    report = {
+        "date": today.isoformat(), "trade_today": True, "skip_reason": None,
+        "market_bias": "neutral", "vix": None, "futures_sp500": None,
+        "futures_nasdaq": None, "oil_change_pct": None, "top_headlines": [],
+        "best_entry_window": "09:45-11:00 AM PDT", "avoid_tickers": [],
+        "confidence": 50, "reasons": [],
+    }
+
+    _check_news(report)
+    _check_vix_simple(report)
+    _final_verdict(report)
+
+    _cache["date"]   = today
+    _cache["report"] = report
+    log.info(f"Market: trade={report['trade_today']} bias={report['market_bias']} confidence={report['confidence']}")
+    return report
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+def _check_news(report):
+    bull_words = ["rally","surge","gain","rise","bull","strong","beats","record","growth","peace","ceasefire"]
+    bear_words = ["fall","drop","decline","crash","bear","weak","miss","war","tariff","inflation","layoff","escalat"]
+    headlines  = []
+    try:
+        r = requests.get("https://finviz.com/news.ashx",
+                         headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+        soup = BeautifulSoup(r.text, "html.parser")
+        headlines = [a.text for a in soup.find_all("a", class_="tab-link")][:25]
+    except Exception as e:
+        log.warning(f"News fetch failed: {e}")
+        return
+
+    report["top_headlines"] = headlines[:8]
+    lower = [h.lower() for h in headlines]
+    bull  = sum(1 for h in lower for w in bull_words if w in h)
+    bear  = sum(1 for h in lower for w in bear_words if w in h)
+    log.info(f"Headlines: bull={bull} bear={bear}")
+
+    if bear > bull + 5:
+        report["market_bias"] = "bearish"
+        report["confidence"]  = max(report["confidence"] - 20, 0)
+        report["reasons"].append(f"News bearish (bull={bull} bear={bear})")
+    elif bull > bear + 5:
+        report["market_bias"] = "bullish"
+        report["confidence"]  = min(report["confidence"] + 15, 100)
+        report["reasons"].append(f"News bullish (bull={bull} bear={bear})")
+    else:
+        report["reasons"].append(f"News neutral (bull={bull} bear={bear})")
+
+    crisis = ["war escalat","market crash","circuit breaker","trading halt","nuclear"]
+    for h in lower:
+        for w in crisis:
+            if w in h:
+                report["trade_today"] = False
+                report["skip_reason"] = f"Crisis keyword detected: {w}"
+                report["reasons"].append(f"CRISIS: {w}")
+                return
+
+
+def _check_vix_simple(report):
+    try:
+        r    = requests.get("https://finance.yahoo.com/quote/%5EVIX/",
+                            headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+        text = BeautifulSoup(r.text, "html.parser").get_text()
+        import re
+        m = re.search(r'"regularMarketPrice"[^}]*?"raw":([\d.]+)', text)
+        if not m:
+            m = re.search(r'VIX.*?(\d{2,3}\.\d{2})', text)
+        if m:
+            vix = float(m.group(1))
+            report["vix"] = vix
+            if vix > 35:
+                report["trade_today"] = False
+                report["skip_reason"] = f"VIX={vix:.1f} extreme fear"
+                report["confidence"]  = max(report["confidence"] - 40, 0)
+                report["reasons"].append(f"VIX={vix:.1f} EXTREME — no trading")
+            elif vix > 25:
+                report["confidence"]  = max(report["confidence"] - 20, 0)
+                report["market_bias"] = "bearish"
+                report["reasons"].append(f"VIX={vix:.1f} elevated fear")
+            elif vix < 15:
+                report["confidence"]  = min(report["confidence"] + 10, 100)
+                report["reasons"].append(f"VIX={vix:.1f} low fear, good conditions")
+    except Exception as e:
+        log.warning(f"VIX fetch failed: {e}")
+
+
+def _final_verdict(report):
+    if not report["trade_today"]:
+        return
+    if report["confidence"] < MIN_CONFIDENCE:
+        report["trade_today"] = False
+        report["skip_reason"] = f"Confidence too low ({report['confidence']}/100)"
+    if report["market_bias"] == "bullish":
+        report["best_entry_window"] = "09:35-10:30 AM PDT"
+    elif report["market_bias"] == "bearish":
+        report["best_entry_window"] = "10:30-11:30 AM PDT"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 def pdt_now():
     return datetime.now(pytz.timezone("America/Los_Angeles"))
 
-def is_trading_allowed():
-    now    = pdt_now()
-    cutoff = now.replace(hour=STOP_TRADING_HOUR, minute=STOP_TRADING_MIN, second=0, microsecond=0)
-    return now < cutoff
+def trading_allowed():
+    now = pdt_now()
+    return now < now.replace(hour=STOP_HOUR, minute=STOP_MIN, second=0, microsecond=0)
 
-def is_in_best_window(best_window: str) -> bool:
-    """Check if current time is within the day's best entry window."""
-    try:
-        now  = pdt_now()
-        part = best_window.split("(")[0].strip()   # e.g. "09:45-11:00 AM PDT"
-        times = part.replace(" AM PDT","").replace(" PDT","").split("-")
-        def to_minutes(t):
-            h, m = map(int, t.strip().split(":"))
-            return h * 60 + m
-        start = to_minutes(times[0])
-        end   = to_minutes(times[1])
-        cur   = now.hour * 60 + now.minute
-        return start <= cur <= end
-    except Exception:
-        return True  # default allow if parse fails
-
-def get_rsi(bars, period=14):
+def get_rsi(bars, p=14):
     try:
         d = bars["close"].diff()
-        g = d.clip(lower=0).rolling(period).mean()
-        l = (-d.clip(upper=0)).rolling(period).mean()
+        g = d.clip(lower=0).rolling(p).mean()
+        l = (-d.clip(upper=0)).rolling(p).mean()
         return float((100-(100/(1+g/l))).iloc[-1])
     except: return None
 
@@ -77,357 +164,219 @@ def get_vwap(bars):
         return float((t*bars["volume"]).sum()/bars["volume"].sum())
     except: return None
 
-def get_support_resistance(bars):
-    """Calculate basic support and resistance levels from recent bars."""
-    try:
-        closes = bars["close"].tail(20)
-        highs  = bars["high"].tail(20)
-        lows   = bars["low"].tail(20)
-        resistance = float(highs.max())
-        support    = float(lows.min())
-        pivot      = float((highs.max() + lows.min() + closes.iloc[-1]) / 3)
-        return support, resistance, pivot
-    except: return None, None, None
-
-def get_ema(bars, period):
-    try:
-        return float(bars["close"].ewm(span=period, adjust=False).mean().iloc[-1])
+def get_ema(bars, p):
+    try: return float(bars["close"].ewm(span=p,adjust=False).mean().iloc[-1])
     except: return None
 
 def too_many(sym):
     today = pdt_now().date()
-    return len([t for t in trade_log.get(sym,[]) if t.date()==today]) >= MAX_DAILY_TRADES
+    return len([t for t in trade_log.get(sym,[]) if t.date()==today]) >= MAX_TRADES
 
 def too_soon(sym, gap=15):
     times = trade_log.get(sym,[])
     if not times: return False
     return (pdt_now()-times[-1]).total_seconds()/60 < gap
 
-def log_t(sym):
+def log_trade(sym):
     trade_log.setdefault(sym,[]).append(pdt_now())
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SMART ENTRY/EXIT CALCULATOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def calculate_entry_exit(symbol, report):
-    """
-    Uses technical analysis + market conditions to calculate
-    optimal entry price, stop loss, and take profit levels.
-    """
+def calc_levels(sym, report):
     try:
-        bars  = api.get_bars(symbol, "5Min", limit=100).df
-        price = float(api.get_latest_trade(symbol).price)
+        bars  = api.get_bars(sym, "5Min", limit=60).df
+        price = float(api.get_latest_trade(sym).price)
     except Exception as e:
-        log.warning(f"Could not fetch data for {symbol}: {e}")
+        log.warning(f"Data fetch failed {sym}: {e}")
         return None
 
-    rsi        = get_rsi(bars)
-    vwap_price = get_vwap(bars)
-    ema9       = get_ema(bars, 9)
-    ema21      = get_ema(bars, 21)
-    support, resistance, pivot = get_support_resistance(bars)
+    rsi   = get_rsi(bars)
+    vwap  = get_vwap(bars)
+    ema9  = get_ema(bars, 9)
+    ema21 = get_ema(bars, 21)
+    bias  = report.get("market_bias","neutral")
+    conf  = report.get("confidence", 50)
 
-    # Dynamic stop/take-profit based on market conditions
-    bias = report.get("market_bias", "neutral")
-    conf = report.get("confidence", 50)
-
-    # Tighter stops on bearish days, wider on bullish
     if bias == "bullish" and conf > 65:
-        sl_pct = STOP_LOSS_PCT          # 2%
-        tp_pct = TAKE_PROFIT_PCT * 1.5  # 3.75% — let winners run on good days
+        sl, tp = STOP_LOSS_PCT, TAKE_PROFIT_PCT * 1.5
     elif bias == "bearish":
-        sl_pct = STOP_LOSS_PCT * 0.75   # 1.5% — tighter stop on bad days
-        tp_pct = TAKE_PROFIT_PCT * 0.8  # 2% — take profit faster on bad days
+        sl, tp = STOP_LOSS_PCT * 0.75, TAKE_PROFIT_PCT * 0.8
     else:
-        sl_pct = STOP_LOSS_PCT          # 2%
-        tp_pct = TAKE_PROFIT_PCT        # 2.5%
+        sl, tp = STOP_LOSS_PCT, TAKE_PROFIT_PCT
 
-    # Adjust stop to use support level if it's better than % stop
-    if support and support > price * (1 - sl_pct * 1.5):
-        stop_price = round(support * 0.995, 2)  # just below support
-    else:
-        stop_price = round(price * (1 - sl_pct), 2)
+    try:
+        support    = float(bars["low"].tail(20).min())
+        resistance = float(bars["high"].tail(20).max())
+        stop  = round(max(support * 0.995, price * (1-sl)), 2)
+        limit = round(min(resistance * 0.998, price * (1+tp)), 2) if resistance < price*(1+tp*2) else round(price*(1+tp),2)
+    except:
+        stop  = round(price * (1-sl), 2)
+        limit = round(price * (1+tp), 2)
 
-    # Adjust take-profit to use resistance if it's reasonable
-    if resistance and resistance < price * (1 + tp_pct * 2):
-        limit_price = round(resistance * 0.998, 2)  # just below resistance
-    else:
-        limit_price = round(price * (1 + tp_pct), 2)
-
-    return {
-        "price":        price,
-        "stop_price":   stop_price,
-        "limit_price":  limit_price,
-        "rsi":          rsi,
-        "vwap":         vwap_price,
-        "ema9":         ema9,
-        "ema21":        ema21,
-        "support":      support,
-        "resistance":   resistance,
-        "pivot":        pivot,
-        "sl_pct":       round(sl_pct * 100, 1),
-        "tp_pct":       round(tp_pct * 100, 1),
-    }
+    return {"price":price,"stop":stop,"limit":limit,"rsi":rsi,"vwap":vwap,"ema9":ema9,"ema21":ema21}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MASTER FILTER CHAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# SMART FILTERS
+# ═════════════════════════════════════════════════════════════════════════════
 
-def run_all_filters(symbol, action):
-    """
-    Complete filter chain for BUY signals.
-    Returns (allowed: bool, reason: str, levels: dict|None)
-    """
+def run_filters(sym, action):
     if action != "BUY":
         return True, "sell always allowed", None
 
-    # ── 1. Daily market intelligence ─────────────────────────────────────────
     report = get_market_report()
-
     if not report["trade_today"]:
-        return False, f"🚫 Market intelligence: {report['skip_reason']}", None
-
+        return False, f"Market intelligence: {report['skip_reason']}", None
     if report["confidence"] < MIN_CONFIDENCE:
-        return False, f"🚫 Market confidence too low ({report['confidence']}/100)", None
+        return False, f"Market confidence too low ({report['confidence']}/100)", None
+    if sym in report.get("avoid_tickers",[]):
+        return False, f"{sym} flagged to avoid today", None
+    if not trading_allowed():
+        return False, f"Past trading cutoff {STOP_HOUR}:{STOP_MIN:02d} PDT", None
+    if too_many(sym):
+        return False, f"Max {MAX_TRADES} trades/day for {sym}", None
+    if too_soon(sym):
+        return False, "15min cooldown active", None
 
-    if symbol in report.get("avoid_tickers", []):
-        return False, f"🚫 {symbol} flagged to avoid today: {', '.join(report['reasons'][:2])}", None
-
-    # ── 2. Time checks ────────────────────────────────────────────────────────
-    if not is_trading_allowed():
-        return False, f"⏰ Past trading cutoff ({STOP_TRADING_HOUR}:{STOP_TRADING_MIN:02d} PDT)", None
-
-    best_window = report.get("best_entry_window", "")
-    if not is_in_best_window(best_window):
-        return False, f"⏰ Outside best entry window ({best_window})", None
-
-    # ── 3. Trade frequency ────────────────────────────────────────────────────
-    if too_many(symbol):
-        return False, f"📊 Max {MAX_DAILY_TRADES} trades/day reached for {symbol}", None
-
-    if too_soon(symbol):
-        return False, f"⏳ Signal within 15min cooldown for {symbol}", None
-
-    # ── 4. Technical analysis ─────────────────────────────────────────────────
-    levels = calculate_entry_exit(symbol, report)
+    levels = calc_levels(sym, report)
     if not levels:
-        return False, "❌ Could not fetch technical data", None
+        return False, "Could not fetch price data", None
 
-    rsi        = levels.get("rsi")
-    vwap_price = levels.get("vwap")
-    price      = levels.get("price")
-    ema9       = levels.get("ema9")
-    ema21      = levels.get("ema21")
+    rsi, vwap, ema9, ema21 = levels.get("rsi"), levels.get("vwap"), levels.get("ema9"), levels.get("ema21")
+    price = levels["price"]
 
-    # RSI filter
     if rsi and rsi > 72:
-        return False, f"📈 RSI={rsi:.1f} overbought — skip", levels
+        return False, f"RSI={rsi:.1f} overbought", levels
+    if vwap and (price-vwap)/vwap < -0.003:
+        return False, f"Price below VWAP — no uptrend", levels
+    if ema9 and ema21 and ema9 < ema21:
+        return False, f"EMA9 below EMA21 — downtrend", levels
+    if report["market_bias"] == "bearish" and report["confidence"] < 40:
+        return False, "Market too bearish for new longs", levels
 
-    if rsi and rsi < 35:
-        log.info(f"{symbol} RSI={rsi:.1f} oversold — allowing contrarian buy")
-
-    # VWAP filter — price must be above VWAP
-    if vwap_price and price:
-        diff = (price - vwap_price) / vwap_price
-        if diff < -0.003:
-            return False, f"📉 {symbol} ${price:.2f} below VWAP ${vwap_price:.2f} — no uptrend", levels
-
-    # EMA trend confirmation — EMA9 must be above EMA21
-    if ema9 and ema21:
-        if ema9 < ema21:
-            return False, f"📉 EMA9 ({ema9:.2f}) below EMA21 ({ema21:.2f}) — downtrend, skip", levels
-
-    # ── 5. Market sentiment from news ─────────────────────────────────────────
-    if report.get("market_bias") == "bearish" and report.get("confidence", 50) < 40:
-        return False, f"📰 Market too bearish for new longs today", levels
-
-    reason = (f"✅ All filters passed | RSI={rsi:.1f if rsi else 'N/A'} | "
-              f"VWAP={vwap_price:.2f if vwap_price else 'N/A'} | "
-              f"Bias={report['market_bias']} | Confidence={report['confidence']}/100")
-
+    reason = f"All filters passed | RSI={rsi:.1f if rsi else 'N/A'} | bias={report['market_bias']} | conf={report['confidence']}"
     return True, reason, levels
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORDER EXECUTION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# ORDER LOGIC
+# ═════════════════════════════════════════════════════════════════════════════
 
-def place_buy(symbol):
-    ok, reason, levels = run_all_filters(symbol, "BUY")
+def place_buy(sym):
+    ok, reason, levels = run_filters(sym, "BUY")
     if not ok:
-        log.info(f"SKIP {symbol}: {reason}")
-        return {"status": "skipped", "reason": reason}
+        log.info(f"SKIP {sym}: {reason}")
+        return {"status":"skipped","reason":reason}
+
+    try:
+        pos = api.get_position(sym)
+        if int(pos.qty) > 0:
+            return {"status":"skipped","reason":f"Already holding {pos.qty} shares"}
+    except: pass
 
     equity = float(api.get_account().equity)
     price  = levels["price"]
-    qty    = int((equity * RISK_PERCENTAGE) / price)
+    qty    = int((equity * RISK_PCT) / price)
     if qty < 1:
-        return {"status": "error", "reason": "Insufficient funds for 1 share"}
+        return {"status":"error","reason":"Insufficient funds"}
 
-    stop  = levels["stop_price"]
-    tp    = levels["limit_price"]
-
-    # Don't buy if already holding
-    try:
-        pos = api.get_position(symbol)
-        if int(pos.qty) > 0:
-            return {"status": "skipped", "reason": f"Already holding {pos.qty} shares of {symbol}"}
-    except: pass
-
-    log.info(f"🟢 BUY {qty} {symbol} @ ${price:.2f} | SL=${stop} TP=${tp} | {reason}")
+    stop  = levels["stop"]
+    limit = levels["limit"]
 
     order = api.submit_order(
-        symbol=symbol, qty=qty, side="buy", type="market",
+        symbol=sym, qty=qty, side="buy", type="market",
         time_in_force="day", order_class="bracket",
-        stop_loss={"stop_price": stop},
-        take_profit={"limit_price": tp}
+        stop_loss={"stop_price":stop}, take_profit={"limit_price":limit}
     )
-
-    log_t(symbol)
+    log_trade(sym)
     report = get_market_report()
-
     return {
-        "status":       "filled",
-        "symbol":       symbol,
-        "qty":          qty,
-        "price":        price,
-        "stop":         stop,
-        "take_profit":  tp,
-        "sl_pct":       levels["sl_pct"],
-        "tp_pct":       levels["tp_pct"],
-        "rsi":          levels.get("rsi"),
-        "vwap":         levels.get("vwap"),
-        "ema9":         levels.get("ema9"),
-        "ema21":        levels.get("ema21"),
-        "support":      levels.get("support"),
-        "resistance":   levels.get("resistance"),
-        "market_bias":  report.get("market_bias"),
-        "confidence":   report.get("confidence"),
-        "filter_reason":reason,
-        "order_id":     order.id,
+        "status":"filled","symbol":sym,"qty":qty,"price":price,
+        "stop":stop,"take_profit":limit,
+        "rsi":levels.get("rsi"),"vwap":levels.get("vwap"),
+        "market_bias":report["market_bias"],"confidence":report["confidence"],
+        "reason":reason,"order_id":order.id
     }
 
 
-def place_sell(symbol):
+def place_sell(sym):
     try:
-        pos = api.get_position(symbol)
-        qty = int(pos.qty)
+        qty = int(api.get_position(sym).qty)
     except:
-        return {"status": "skipped", "reason": f"No position in {symbol}"}
-
+        return {"status":"skipped","reason":f"No position in {sym}"}
     for o in api.list_orders(status="open"):
-        if o.symbol == symbol: api.cancel_order(o.id)
-
-    order = api.submit_order(symbol=symbol, qty=qty, side="sell",
-                             type="market", time_in_force="day")
-    return {"status": "submitted", "symbol": symbol, "qty": qty, "order_id": order.id}
+        if o.symbol == sym: api.cancel_order(o.id)
+    order = api.submit_order(symbol=sym,qty=qty,side="sell",type="market",time_in_force="day")
+    return {"status":"submitted","symbol":sym,"qty":qty,"order_id":order.id}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FLASK ROUTES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data   = request.get_json(force=True)
-    symbol = str(data.get("ticker","")).upper().strip()
+    sym    = str(data.get("ticker","")).upper().strip()
     action = str(data.get("action","")).upper().strip()
-    log.info(f"Signal: {action} {symbol}")
-
-    if symbol not in ALLOWED_TICKERS:
-        return jsonify({"status":"skipped","reason":f"{symbol} not in allowed list"})
-
-    result = place_buy(symbol) if action == "BUY" else place_sell(symbol) if action == "SELL" else None
+    log.info(f"Signal: {action} {sym}")
+    if sym not in ALLOWED_TICKERS:
+        return jsonify({"status":"skipped","reason":f"{sym} not allowed"})
+    result = place_buy(sym) if action=="BUY" else place_sell(sym) if action=="SELL" else None
     if result is None:
         return jsonify({"error":f"Unknown action: {action}"}), 400
-
     return jsonify(result)
 
 
 @app.route("/", methods=["GET"])
 def status():
-    report = get_market_report()
-    now    = pdt_now()
+    report    = get_market_report()
     positions = []
     try:
         for p in api.list_positions():
             positions.append({"symbol":p.symbol,"qty":p.qty,"entry":p.avg_entry_price,
-                               "current":p.current_price,"pnl":p.unrealized_pl,"pnl_pct":p.unrealized_plpc})
+                               "current":p.current_price,"pnl":p.unrealized_pl})
     except: pass
-
     return jsonify({
-        "status":             "ok",
-        "service":            "ApexTrade Super Bot v2.0",
-        "time_pdt":           now.strftime("%I:%M %p PDT"),
-        "trading_allowed":    is_trading_allowed(),
-        "market_report": {
-            "trade_today":        report["trade_today"],
-            "skip_reason":        report["skip_reason"],
-            "market_bias":        report["market_bias"],
-            "confidence":         report["confidence"],
-            "vix":                report["vix"],
-            "futures_sp500":      report["futures_sp500"],
-            "futures_nasdaq":     report["futures_nasdaq"],
-            "oil_change_pct":     report["oil_change_pct"],
-            "best_entry_window":  report["best_entry_window"],
-            "avoid_tickers":      report["avoid_tickers"],
-            "reasons":            report["reasons"],
-            "top_headlines":      report["top_headlines"][:5],
+        "status":"ok","service":"ApexTrade Super Bot v2.0",
+        "time_pdt":pdt_now().strftime("%I:%M %p PDT"),
+        "trading_allowed":trading_allowed(),
+        "market":{
+            "trade_today":   report["trade_today"],
+            "skip_reason":   report["skip_reason"],
+            "bias":          report["market_bias"],
+            "confidence":    report["confidence"],
+            "vix":           report["vix"],
+            "best_window":   report["best_entry_window"],
+            "reasons":       report["reasons"],
         },
-        "settings": {
-            "risk_pct":    f"{RISK_PERCENTAGE*100:.1f}%",
-            "stop_loss":   f"{STOP_LOSS_PCT*100:.1f}%",
-            "take_profit": f"{TAKE_PROFIT_PCT*100:.1f}%",
-            "max_trades":  MAX_DAILY_TRADES,
-            "tickers":     ALLOWED_TICKERS,
-        },
-        "trades_today":    {k: len(v) for k, v in trade_log.items()},
-        "open_positions":  positions,
+        "settings":{"risk_pct":f"{RISK_PCT*100:.1f}%","stop_loss":f"{STOP_LOSS_PCT*100:.1f}%",
+                    "take_profit":f"{TAKE_PROFIT_PCT*100:.1f}%","max_trades":MAX_TRADES},
+        "trades_today":{k:len(v) for k,v in trade_log.items()},
+        "open_positions":positions,
     })
 
 
 @app.route("/market", methods=["GET"])
-def market_report():
-    """Get today's full market intelligence report."""
-    force  = request.args.get("refresh","false").lower() == "true"
-    report = get_market_report(force=force)
-    return jsonify(report)
+def market():
+    force = request.args.get("refresh","false").lower()=="true"
+    return jsonify(get_market_report(force=force))
 
 
 @app.route("/analyze/<symbol>", methods=["GET"])
 def analyze(symbol):
-    """Analyze a specific symbol — show entry/exit levels without trading."""
-    symbol = symbol.upper()
+    sym    = symbol.upper()
     report = get_market_report()
-    levels = calculate_entry_exit(symbol, report)
-    if not levels:
-        return jsonify({"error":"Could not fetch data"}), 500
-
-    ok, reason, _ = run_all_filters(symbol, "BUY")
-    return jsonify({
-        "symbol":        symbol,
-        "would_trade":   ok,
-        "reason":        reason,
-        "market_bias":   report["market_bias"],
-        "confidence":    report["confidence"],
-        "levels":        levels,
-        "avoid_today":   symbol in report.get("avoid_tickers",[]),
-    })
+    levels = calc_levels(sym, report)
+    if not levels: return jsonify({"error":"Could not fetch data"}), 500
+    ok, reason, _ = run_filters(sym, "BUY")
+    return jsonify({"symbol":sym,"would_trade":ok,"reason":reason,
+                    "bias":report["market_bias"],"confidence":report["confidence"],"levels":levels})
 
 
 @app.route("/sentiment", methods=["GET"])
-def sentiment_route():
-    report = get_market_report()
-    return jsonify({
-        "sentiment":   report["market_bias"],
-        "confidence":  report["confidence"],
-        "trade_today": report["trade_today"],
-        "vix":         report["vix"],
-        "headlines":   report["top_headlines"][:5],
-    })
+def sentiment():
+    r = get_market_report()
+    return jsonify({"sentiment":r["market_bias"],"confidence":r["confidence"],
+                    "trade_today":r["trade_today"],"vix":r["vix"],"headlines":r["top_headlines"][:5]})
 
 
 @app.route("/close-all", methods=["POST"])
@@ -439,4 +388,3 @@ def close_all():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8080)), debug=False)
-
