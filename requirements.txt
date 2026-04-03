@@ -1,9 +1,5 @@
-flask==3.0.3
-flask-cors==4.0.0
-alpaca-trade-api==3.2.0
-gunicorn==22.0.0
-pytz==2024.1
-requests==2.31.0
-beautifulsoup4==4.12.3
-stripe==7.0.0
-pandas==2.0.3
+USE_ATR_STOPS=true
+   ATR_STOP_MULT=1.5
+   ATR_TP1_MULT=2.0
+   ATR_TP2_MULT=3.5
+   MIN_RR=1.2
